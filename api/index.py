@@ -99,26 +99,50 @@ def download_line_image(message_id):
         return None
 
 def call_dify_api(user_id, image_data):
-    # 【重要修正】移除 Content-Type，讓 requests 自動處理 multipart/form-data 的邊界
-    headers = {'Authorization': f'Bearer {dify_api_key}'}
+    # 【最终极的修正】
+    # Dify API 对 multipart/form-data 的处理有非常特殊的要求。
+    # 我们需要先上传文件，获得一个 file_id，然后再将这个 file_id 作为 inputs 发送。
     
-    files = {
-        'inputs': (None, json.dumps({})), # 將 JSON inputs 作為一個部分
-        'response_mode': (None, 'blocking'),
-        'user': (None, user_id),
-        'conversation_id': (None, ''),
-        'pipe_drawing_image': ('image.jpeg', image_data, 'image/jpeg')
-    }
-    
+    # 步骤 1: 上传文件
+    upload_url = "https://api.dify.ai/v1/files/upload"
+    upload_headers = {'Authorization': f'Bearer {dify_api_key}'}
+    upload_files = {'file': ('image.jpeg', image_data, 'image/jpeg')}
+    upload_data = {'user': user_id}
+
     try:
-        response = requests.post(dify_api_url, headers=headers, files=files, timeout=300)
+        upload_response = requests.post(upload_url, headers=upload_headers, files=upload_files, data=upload_data, timeout=60)
+        upload_response.raise_for_status()
+        upload_result = upload_response.json()
+        file_id = upload_result.get('id')
+        if not file_id:
+            return "Dify 文件上传成功，但未返回 file_id。"
+    except Exception as e:
+        app.logger.error(f"Dify 文件上传失败: {e} - {upload_response.text if 'upload_response' in locals() else 'No response'}")
+        return f"Dify 文件上传失败: {e}"
+
+    # 步骤 2: 发送聊天请求，带上 file_id
+    chat_headers = {'Authorization': f'Bearer {dify_api_key}', 'Content-Type': 'application/json'}
+    chat_data = {
+        "inputs": {},
+        "query": "请根据我上传的图片进行分析", # 必须有一个 query
+        "response_mode": "blocking",
+        "conversation_id": "",
+        "user": user_id,
+        "files": [
+            {
+                "type": "image",
+                "transfer_method": "remote_url", # 或者 local_file，但这里用 remote_url 指代已上传的文件
+                "upload_file_id": file_id
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(dify_api_url, headers=chat_headers, json=chat_data, timeout=300)
         response.raise_for_status()
         response_data = response.json()
         full_answer = response_data.get('answer', '')
         return full_answer if full_answer else "分析完成，但未收到有效回覆。"
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Dify API 呼叫失敗: {e} - {response.text if 'response' in locals() else 'No response'}")
-        return f"Dify API 呼叫失敗: {e}"
-    except json.JSONDecodeError:
-        app.logger.error(f"無法解析 Dify 的回覆: {response.text}")
-        return f"無法解析 Dify 的回覆。原始回覆: {response.text[:200]}"
+    except Exception as e:
+        app.logger.error(f"Dify API 呼叫失败: {e} - {response.text if 'response' in locals() else 'No response'}")
+        return f"Dify API 呼叫失败: {e}"
