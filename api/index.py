@@ -3,6 +3,7 @@ import os
 import sys
 import requests
 import logging
+import base64
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -23,7 +24,7 @@ dify_api_url = os.getenv('DIFY_API_URL', None)
 # 檢查環境變數
 if not all([channel_secret, channel_access_token, dify_api_key, dify_api_url]):
     logging.error('錯誤：一個或多個必要的環境變數缺失！')
-    sys.exit(1)
+    # 在 serverless 環境中，不建議 sys.exit(1)
 
 handler = WebhookHandler(channel_secret)
 configuration = Configuration(access_token=channel_access_token)
@@ -39,7 +40,7 @@ def callback():
         app.logger.error("Invalid signature. Please check your channel secret.")
         abort(400)
     except Exception as e:
-        app.logger.error(f"Error occurred: {e}")
+        app.logger.error(f"Error occurred in callback: {e}")
         abort(500)
     return 'OK'
 
@@ -59,14 +60,13 @@ def handle_image_message(event):
             )
         except Exception as e:
             app.logger.error(f"無法回覆 LINE 訊息: {e}")
-            # 即使無法 reply，也要繼續後續流程
 
         try:
-            # 2. 下載圖片
-            message_content = line_bot_api.get_message_content(message_id=event.message.id)
+            # 2. 下載圖片內容 (V3 版本的新方法)
+            message_content_b64 = line_bot_api.get_message_content_as_b64str(message_id=event.message.id)
 
             # 3. 呼叫 Dify
-            dify_response_text = call_dify_api(user_id, message_content)
+            dify_response_text = call_dify_api(user_id, message_content_b64)
             
             # 4. 推送 Dify 結果
             if dify_response_text:
@@ -83,17 +83,23 @@ def handle_image_message(event):
             line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"處理您的請求時發生內部錯誤，請稍後再試。")]))
 
 
-def call_dify_api(user_id, image_bytes):
+def call_dify_api(user_id, image_b64_str):
     headers = {'Authorization': f'Bearer {dify_api_key}'}
-    files = {'pipe_drawing_image': ('image.jpeg', image_bytes, 'image/jpeg')}
-    # 將 conversation_id 留空，讓 Dify 為每個用戶自動管理會話
+    
+    # 解碼 base64 字串
+    try:
+        image_data = base64.b64decode(image_b64_str)
+    except Exception as e:
+        app.logger.error(f"Base64 解碼失敗: {e}")
+        return "無法處理您上傳的圖片格式。"
+        
+    files = {'pipe_drawing_image': ('image.jpeg', image_data, 'image/jpeg')}
     data = {'inputs': '{}', 'response_mode': 'blocking', 'user': user_id, 'conversation_id': ''}
     
     try:
         response = requests.post(dify_api_url, headers=headers, files=files, data=data, timeout=300)
         response.raise_for_status()
         
-        # 處理 Dify 的回覆
         response_data = response.json()
         full_answer = response_data.get('answer', '')
         
@@ -102,7 +108,7 @@ def call_dify_api(user_id, image_bytes):
     except requests.exceptions.RequestException as e:
         app.logger.error(f"Dify API 呼叫失敗: {e}")
         return f"Dify API 呼叫失敗: {e}"
-    except ValueError: # JSONDecodeError
+    except ValueError:
         app.logger.error(f"無法解析 Dify 的回覆: {response.text}")
         return f"無法解析 Dify 的回覆。原始回覆: {response.text[:200]}"
 
