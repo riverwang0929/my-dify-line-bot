@@ -3,12 +3,11 @@ import os
 import sys
 import requests
 import logging
+import json
+import hmac
+import hashlib
 import base64
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, PushMessageRequest
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
 
 # 配置日誌
 logging.basicConfig(level=logging.INFO)
@@ -24,61 +23,80 @@ if not all([channel_secret, channel_access_token, dify_api_key, dify_api_url]):
     logging.error('錯誤：一個或多個必要的環境變數缺失！')
     sys.exit(1)
 
-handler = WebhookHandler(channel_secret)
-configuration = Configuration(access_token=channel_access_token)
-
 @app.route("/callback", methods=['POST'])
 def callback():
+    # 手動驗證簽名
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    
     try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
+        hash = hmac.new(channel_secret.encode('utf-8'), body.encode('utf-8'), hashlib.sha256).digest()
+        if signature != base64.b64encode(hash).decode('utf-8'):
+            abort(400)
+    except Exception as e:
+        app.logger.error(f"簽名驗證失敗: {e}")
         abort(400)
+
+    # 解析 webhook 事件
+    events = request.json.get('events', [])
+    for event in events:
+        if event['type'] == 'message':
+            handle_message(event)
+
     return 'OK'
 
-@handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image_message(event):
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        user_id = event.source.user_id
+def handle_message(event):
+    message_type = event['message']['type']
+    reply_token = event['replyToken']
+    user_id = event['source']['userId']
 
-        try:
-            # 1. 立刻回覆，避免 LINE 超時
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text='圖面已收到，專家系統分析中，請稍候約30秒...')]
-                )
-            )
-        except Exception as e:
-            app.logger.error(f"無法回覆 LINE 訊息: {e}")
+    if message_type == 'image':
+        message_id = event['message']['id']
+        # 1. 立刻回覆，避免 LINE 超時
+        reply_message(reply_token, '圖面已收到，專家系統分析中，請稍候約30秒...')
 
-        try:
-            # 2. 【100% 正確的 V3 版本下載圖片方法】
-            message_id = event.message.id
-            # 使用 messaging_api_blob 下載
-            from linebot.v3.messaging import MessagingApiBlob
-            line_bot_blob_api = MessagingApiBlob(api_client)
-            response_content = line_bot_blob_api.download_message_content(message_id=message_id)
-            # response_content 直接就是圖片的二進制數據
-            image_data = response_content
+        # 2. 手動下載圖片
+        image_data = download_line_image(message_id)
+        if not image_data:
+            push_message(user_id, '無法下載您上傳的圖片，請稍後再試。')
+            return
 
-            # 3. 呼叫 Dify
-            dify_response_text = call_dify_api(user_id, image_data)
-            
-            # 4. 推送 Dify 結果
-            if dify_response_text:
-                for i in range(0, len(dify_response_text), 4800):
-                    chunk = dify_response_text[i:i+4800]
-                    line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=chunk)]))
-            else:
-                line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text="分析完成，但 Dify 未提供有效回覆。")]))
+        # 3. 呼叫 Dify
+        dify_response_text = call_dify_api(user_id, image_data)
+        
+        # 4. 推送 Dify 結果
+        if dify_response_text:
+            for i in range(0, len(dify_response_text), 4800):
+                chunk = dify_response_text[i:i+4800]
+                push_message(user_id, chunk)
+        else:
+            push_message(user_id, "分析完成，但 Dify 未提供有效回覆。")
 
-        except Exception as e:
-            app.logger.error(f"處理圖片或呼叫 Dify 時發生錯誤: {e}")
-            line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"處理您的請求時發生內部錯誤，請稍後再試。")]))
+    elif message_type == 'text':
+        reply_message(reply_token, '您好，請直接上傳需要分析的管件圖面。')
+
+def reply_message(reply_token, text):
+    url = 'https://api.line.me/v2/bot/message/reply'
+    headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {channel_access_token}'}
+    data = {'replyToken': reply_token, 'messages': [{'type': 'text', 'text': text}]}
+    requests.post(url, headers=headers, json=data)
+
+def push_message(user_id, text):
+    url = 'https://api.line.me/v2/bot/message/push'
+    headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {channel_access_token}'}
+    data = {'to': user_id, 'messages': [{'type': 'text', 'text': text}]}
+    requests.post(url, headers=headers, json=data)
+
+def download_line_image(message_id):
+    url = f'https://api-data.line.me/v2/bot/message/{message_id}/content'
+    headers = {'Authorization': f'Bearer {channel_access_token}'}
+    try:
+        response = requests.get(url, headers=headers, stream=True)
+        response.raise_for_status()
+        return response.content
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"下載 LINE 圖片失敗: {e}")
+        return None
 
 def call_dify_api(user_id, image_data):
     headers = {'Authorization': f'Bearer {dify_api_key}'}
@@ -94,14 +112,3 @@ def call_dify_api(user_id, image_data):
     except Exception as e:
         app.logger.error(f"Dify API 呼叫失敗: {e}")
         return f"Dify API 呼叫失敗: {e}"
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_text_message(event):
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text='您好，請直接上傳需要分析的管件圖面。')]
-            )
-        )
