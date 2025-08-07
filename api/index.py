@@ -26,10 +26,6 @@ if not all([channel_secret, channel_access_token, dify_api_key, dify_api_url]):
 
 handler = WebhookHandler(channel_secret)
 configuration = Configuration(access_token=channel_access_token)
-api_client = ApiClient(configuration)
-# 建立一個可以下載檔案的 API 實例
-messaging_api_blob = ApiClient(configuration, pool_threads=0)
-
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -44,44 +40,45 @@ def callback():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
-    line_bot_api = MessagingApi(api_client)
-    user_id = event.source.user_id
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        user_id = event.source.user_id
 
-    try:
-        # 1. 立刻回覆，避免 LINE 超時
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text='圖面已收到，專家系統分析中，請稍候約30秒...')]
+        try:
+            # 1. 立刻回覆，避免 LINE 超時
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text='圖面已收到，專家系統分析中，請稍候約30秒...')]
+                )
             )
-        )
-    except Exception as e:
-        app.logger.error(f"無法回覆 LINE 訊息: {e}")
+        except Exception as e:
+            app.logger.error(f"無法回覆 LINE 訊息: {e}")
 
-    try:
-        # 2. 【正確的 V3 版本下載圖片方法】
-        message_id = event.message.id
-        # 使用專門下載檔案的 API 實例
-        with messaging_api_blob as api_blob_client:
-             response = api_blob_client.get_message_content(message_id=message_id)
-             # response 直接就是圖片的二進制數據
-             image_data = response.read()
+        try:
+            # 2. 【100% 正確的 V3 版本下載圖片方法】
+            message_id = event.message.id
+            # 使用 messaging_api_blob 下載
+            from linebot.v3.messaging import MessagingApiBlob
+            line_bot_blob_api = MessagingApiBlob(api_client)
+            response_content = line_bot_blob_api.download_message_content(message_id=message_id)
+            # response_content 直接就是圖片的二進制數據
+            image_data = response_content
 
+            # 3. 呼叫 Dify
+            dify_response_text = call_dify_api(user_id, image_data)
+            
+            # 4. 推送 Dify 結果
+            if dify_response_text:
+                for i in range(0, len(dify_response_text), 4800):
+                    chunk = dify_response_text[i:i+4800]
+                    line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=chunk)]))
+            else:
+                line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text="分析完成，但 Dify 未提供有效回覆。")]))
 
-        # 3. 呼叫 Dify
-        dify_response_text = call_dify_api(user_id, image_data)
-        
-        # 4. 推送 Dify 結果
-        if dify_response_text:
-            for i in range(0, len(dify_response_text), 4800):
-                chunk = dify_response_text[i:i+4800]
-                line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=chunk)]))
-        else:
-            line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text="分析完成，但 Dify 未提供有效回覆。")]))
-
-    except Exception as e:
-        app.logger.error(f"處理圖片或呼叫 Dify 時發生錯誤: {e}")
-        line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"處理您的請求時發生內部錯誤，請稍後再試。")]))
+        except Exception as e:
+            app.logger.error(f"處理圖片或呼叫 Dify 時發生錯誤: {e}")
+            line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"處理您的請求時發生內部錯誤，請稍後再試。")]))
 
 def call_dify_api(user_id, image_data):
     headers = {'Authorization': f'Bearer {dify_api_key}'}
@@ -100,10 +97,11 @@ def call_dify_api(user_id, image_data):
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    line_bot_api = MessagingApi(api_client)
-    line_bot_api.reply_message_with_http_info(
-        ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text='您好，請直接上傳需要分析的管件圖面。')]
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text='您好，請直接上傳需要分析的管件圖面。')]
+            )
         )
-    )
