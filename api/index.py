@@ -99,16 +99,26 @@ def download_line_image(message_id):
         return None
 
 def call_dify_api(user_id, image_data):
+    # 【重要修正】移除 Content-Type，讓 requests 自動處理 multipart/form-data 的邊界
     headers = {'Authorization': f'Bearer {dify_api_key}'}
-    files = {'pipe_drawing_image': ('image.jpeg', image_data, 'image/jpeg')}
-    data = {'inputs': '{}', 'response_mode': 'blocking', 'user': user_id, 'conversation_id': ''}
+    
+    files = {
+        'inputs': (None, json.dumps({})), # 將 JSON inputs 作為一個部分
+        'response_mode': (None, 'blocking'),
+        'user': (None, user_id),
+        'conversation_id': (None, ''),
+        'pipe_drawing_image': ('image.jpeg', image_data, 'image/jpeg')
+    }
     
     try:
-        response = requests.post(dify_api_url, headers=headers, files=files, data=data, timeout=300)
+        response = requests.post(dify_api_url, headers=headers, files=files, timeout=300)
         response.raise_for_status()
         response_data = response.json()
         full_answer = response_data.get('answer', '')
         return full_answer if full_answer else "分析完成，但未收到有效回覆。"
-    except Exception as e:
-        app.logger.error(f"Dify API 呼叫失敗: {e}")
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Dify API 呼叫失敗: {e} - {response.text if 'response' in locals() else 'No response'}")
         return f"Dify API 呼叫失敗: {e}"
+    except json.JSONDecodeError:
+        app.logger.error(f"無法解析 Dify 的回覆: {response.text}")
+        return f"無法解析 Dify 的回覆。原始回覆: {response.text[:200]}"
